@@ -5,15 +5,15 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/user"
 	"path/filepath"
 	"strings"
 
-	"github.com/btcsuite/btcutil"
+	"github.com/btcsuite/btcd/btcutil"
 	"github.com/jessevdk/go-flags"
-	"github.com/lightningnetwork/lnd/tor"
 )
 
 const (
@@ -38,6 +38,8 @@ type chainConfig struct {
 	Active   bool `long:"active" description:"If the chain should be active or not"`
 	MainNet  bool `long:"mainnet" description:"Use the main network"`
 	TestNet3 bool `long:"testnet" description:"Use the test network"`
+	TestNet4 bool `long:"testnet4" description:"Use the testnet4 network"`
+	SigNet   bool `long:"signet" description:"Use the signet network"`
 	SimNet   bool `long:"simnet" description:"Use the simulation test network"`
 	RegTest  bool `long:"regtest" description:"Use the regression test network"`
 }
@@ -65,7 +67,7 @@ type config struct {
 	LndConnect *lndConnectConfig `group:"LndConnect"`
 
 	LndDir         string `long:"lnddir" description:"The base directory that contains lnd's data, logs, configuration file, etc."`
-	ConfigFile     string `long:"C" long:"configfile" description:"Path to configuration file"`
+	ConfigFile     string `short:"C" long:"configfile" description:"Path to configuration file"`
 	DataDir        string `short:"b" long:"datadir" description:"The directory to find lnd's data within"`
 	TLSCertPath    string `long:"tlscertpath" description:"Path to read the TLS certificate from"`
 	AdminMacPath   string `long:"adminmacaroonpath" description:"Path to read the admin macaroon from"`
@@ -85,18 +87,16 @@ type config struct {
 	Autopilot     *chainConfig `hidden:"true" group:"Autopilot" namespace:"autopilot"`
 	Tor           *chainConfig `hidden:"true" group:"Tor" namespace:"tor"`
 	Hodl          *chainConfig `hidden:"true" group:"hodl" namespace:"hodl"`
-
-	net tor.Net
 }
 
 // loadConfig initializes and parses the config using a config file and command
 // line options.
 //
 // The configuration proceeds as follows:
-// 	1) Start with a default config with sane settings
-// 	2) Pre-parse the command line to check for an alternative config file
-// 	3) Load configuration file overwriting defaults with any specified options
-// 	4) Parse CLI options and overwrite/add any specified options
+//  1. Start with a default config with sane settings
+//  2. Pre-parse the command line to check for an alternative config file
+//  3. Load configuration file overwriting defaults with any specified options
+//  4. Parse CLI options and overwrite/add any specified options
 func loadConfig() (*config, error) {
 	defaultCfg := config{
 		LndConnect: &lndConnectConfig{
@@ -106,13 +106,12 @@ func loadConfig() (*config, error) {
 		ConfigFile:  defaultConfigFile,
 		DataDir:     defaultDataDir,
 		TLSCertPath: defaultTLSCertPath,
-		net:         &tor.ClearNet{},
 	}
 
 	// Pre-parse the command line options to pick up an alternative config
 	// file.
 	preCfg := defaultCfg
-	if _, err := flags.Parse(&preCfg); err != nil {
+	if _, err := flags.NewParser(&preCfg, flags.HelpFlag).Parse(); err != nil {
 		return nil, err
 	}
 
@@ -120,6 +119,8 @@ func loadConfig() (*config, error) {
 	// path to all of the files and directories that will live within it.
 	lndDir := cleanAndExpandPath(preCfg.LndDir)
 	configFilePath := cleanAndExpandPath(preCfg.ConfigFile)
+	configFileGiven := configFilePath != defaultConfigFile
+	preCfg.ConfigFile = configFilePath
 	if lndDir != defaultLndDir {
 		// If the config file path has not been modified by the user,
 		// then we'll use the default config file path. However, if the
@@ -140,50 +141,51 @@ func loadConfig() (*config, error) {
 	// so while parsing the config file, we only take what we need, ignoring
 	// all the unknown (to us) options.
 	p := flags.NewParser(&cfg, flags.IgnoreUnknown)
-	if err := flags.NewIniParser(p).ParseFile(cfg.ConfigFile); err != nil {
+	err := flags.NewIniParser(p).ParseFile(cfg.ConfigFile)
+	switch {
+	case err == nil:
+	case errors.Is(err, os.ErrNotExist) && !configFileGiven:
+		// No lnd.conf at the default location is normal when the cert
+		// and macaroon paths are passed directly.
+	default:
 		configFileError = err
 	}
 
 	// Finally, parse the remaining command line options again to ensure
 	// they take precedence.
-	if _, err := flags.Parse(&cfg); err != nil {
+	if _, err := flags.NewParser(&cfg, flags.HelpFlag).Parse(); err != nil {
 		return nil, err
 	}
 
 	primaryChain := "bitcoin"
 	networkName := "mainnet"
 
-	switch {
-	case cfg.Litecoin.Active:
+	if cfg.Litecoin.Active {
 		primaryChain = "litecoin"
-		networkName = "mainnet"
-	case cfg.Bitcoin.Active:
+	} else {
+		nets := []struct {
+			set  bool
+			name string
+		}{
+			{cfg.Bitcoin.MainNet, "mainnet"},
+			{cfg.Bitcoin.TestNet3, "testnet"},
+			{cfg.Bitcoin.TestNet4, "testnet4"},
+			{cfg.Bitcoin.SigNet, "signet"},
+			{cfg.Bitcoin.RegTest, "regtest"},
+			{cfg.Bitcoin.SimNet, "simnet"},
+		}
 		numNets := 0
-		if cfg.Bitcoin.MainNet {
-			numNets++
-			networkName = "mainnet"
-		}
-		if cfg.Bitcoin.TestNet3 {
-			numNets++
-			networkName = "testnet"
-		}
-		if cfg.Bitcoin.RegTest {
-			numNets++
-			networkName = "regtest"
-		}
-		if cfg.Bitcoin.SimNet {
-			numNets++
-			networkName = "simnet"
+		for _, n := range nets {
+			if n.set {
+				numNets++
+				networkName = n.name
+			}
 		}
 		if numNets > 1 {
-			str := "The mainnet, testnet, regtest, and " +
-				"simnet params can't be used together -- " +
-				"choose one of the four"
-			err := fmt.Errorf(str)
-			return nil, err
+			return nil, errors.New("the mainnet, testnet, testnet4, " +
+				"signet, regtest, and simnet params can't be used " +
+				"together -- choose one")
 		}
-
-		primaryChain = "bitcoin"
 	}
 
 	// As soon as we're done parsing configuration options, ensure all paths

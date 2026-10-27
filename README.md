@@ -6,11 +6,21 @@ For more information take a look at the [specification of the uri format](lnd_co
 
 ## Installing lndconnect
 
+Requires Go 1.21 or newer.
+
 ```
-go get -d github.com/LN-Zap/lndconnect
-cd $GOPATH/src/github.com/LN-Zap/lndconnect
+go install github.com/LN-Zap/lndconnect@latest
+```
+
+Or build from a checkout:
+
+```
+git clone https://github.com/LN-Zap/lndconnect
+cd lndconnect
 make
 ```
+
+The binary is installed to `$(go env GOPATH)/bin`.
 
 ## Starting lndconnect
 

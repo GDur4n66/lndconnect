@@ -3,8 +3,8 @@ package main
 import (
 	b64 "encoding/base64"
 	"encoding/pem"
+	"errors"
 	"fmt"
-	"io/ioutil"
 	"net"
 	"net/url"
 	"os"
@@ -12,46 +12,81 @@ import (
 
 	"github.com/Baozisoftware/qrcode-terminal-go"
 	"github.com/glendc/go-external-ip"
+	"github.com/jessevdk/go-flags"
 	"github.com/skip2/go-qrcode"
 )
 
+// getLocalIP returns the LAN address of this machine. It first asks the
+// kernel which source address it would use for an outbound route (a UDP
+// "connect" sends no packets), then falls back to scanning interfaces,
+// preferring private addresses over public ones.
 func getLocalIP() string {
-	addrs, err := net.InterfaceAddrs()
+	if conn, err := net.Dial("udp4", "192.0.2.1:9"); err == nil {
+		addr, ok := conn.LocalAddr().(*net.UDPAddr)
+		conn.Close()
+		if ok && addr.IP.IsPrivate() {
+			return addr.IP.String()
+		}
+	}
+
+	ifaces, err := net.Interfaces()
 	if err != nil {
 		return ""
 	}
-	for _, address := range addrs {
-		if ipnet, ok := address.(*net.IPNet); ok && !ipnet.IP.IsLoopback() {
-			if ipnet.IP.To4() != nil {
+	fallback := ""
+	for _, iface := range ifaces {
+		if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
+			continue
+		}
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		for _, address := range addrs {
+			ipnet, ok := address.(*net.IPNet)
+			if !ok || ipnet.IP.To4() == nil || ipnet.IP.IsLinkLocalUnicast() {
+				continue
+			}
+			if ipnet.IP.IsPrivate() {
 				return ipnet.IP.String()
+			}
+			if fallback == "" {
+				fallback = ipnet.IP.String()
 			}
 		}
 	}
-	return ""
+	return fallback
 }
 
-func getPublicIP() string {
+func getPublicIP() (string, error) {
 	consensus := externalip.DefaultConsensus(nil, nil)
 	ip, err := consensus.ExternalIP()
 	if err != nil {
-		fmt.Println(err)
-		os.Exit(1)
+		return "", err
 	}
 
-	return ip.String()
+	return ip.String(), nil
 }
 
 func main() {
 	loadedConfig, err := loadConfig()
 	if err != nil {
-		fmt.Println(err)
-		return
+		var flagsErr *flags.Error
+		if errors.As(err, &flagsErr) && flagsErr.Type == flags.ErrHelp {
+			fmt.Println(err)
+			return
+		}
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
 	}
 
-	displayLink(loadedConfig)
+	if err := displayLink(loadedConfig); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
 }
 
-func displayLink(loadedConfig *config) {
+func displayLink(loadedConfig *config) error {
 	var err error
 
 	// host
@@ -60,10 +95,16 @@ func displayLink(loadedConfig *config) {
 		ipString = loadedConfig.LndConnect.Host
 	} else if loadedConfig.LndConnect.LocalIp {
 		ipString = getLocalIP()
+		if ipString == "" {
+			return errors.New("could not determine local ip")
+		}
 	} else if loadedConfig.LndConnect.Localhost {
 		ipString = "127.0.0.1"
 	} else {
-		ipString = getPublicIP()
+		ipString, err = getPublicIP()
+		if err != nil {
+			return err
+		}
 	}
 
 	ipString = net.JoinHostPort(ipString, fmt.Sprint(loadedConfig.LndConnect.Port))
@@ -73,18 +114,18 @@ func displayLink(loadedConfig *config) {
 
 	// cert
 	if !loadedConfig.LndConnect.NoCert {
-		certBytes, err := ioutil.ReadFile(loadedConfig.TLSCertPath)
+		certBytes, err := os.ReadFile(loadedConfig.TLSCertPath)
 		if err != nil {
-			fmt.Println(err)
-			return
+			return err
 		}
 
 		block, _ := pem.Decode(certBytes)
 		if block == nil || block.Type != "CERTIFICATE" {
-			fmt.Println("failed to decode PEM block containing certificate")
+			return fmt.Errorf("%s: failed to decode PEM block "+
+				"containing certificate", loadedConfig.TLSCertPath)
 		}
 
-		certificate := b64.RawURLEncoding.EncodeToString([]byte(block.Bytes))
+		certificate := b64.RawURLEncoding.EncodeToString(block.Bytes)
 
 		q.Add("cert", certificate)
 	}
@@ -92,29 +133,28 @@ func displayLink(loadedConfig *config) {
 	// macaroon
 	var macBytes []byte
 	if loadedConfig.LndConnect.Invoice {
-		macBytes, err = ioutil.ReadFile(loadedConfig.InvoiceMacPath)
+		macBytes, err = os.ReadFile(loadedConfig.InvoiceMacPath)
 	} else if loadedConfig.LndConnect.Readonly {
-		macBytes, err = ioutil.ReadFile(loadedConfig.ReadMacPath)
+		macBytes, err = os.ReadFile(loadedConfig.ReadMacPath)
 	} else {
-		macBytes, err = ioutil.ReadFile(loadedConfig.AdminMacPath)
+		macBytes, err = os.ReadFile(loadedConfig.AdminMacPath)
 	}
 
 	if err != nil {
-		fmt.Println(err)
-		return
+		return err
 	}
 
-	macaroonB64 := b64.RawURLEncoding.EncodeToString([]byte(macBytes))
+	macaroonB64 := b64.RawURLEncoding.EncodeToString(macBytes)
 
 	q.Add("macaroon", macaroonB64)
 
 	// custom query
 	for _, s := range loadedConfig.LndConnect.Query {
-		queryParts := strings.Split(s, "=")
+		// Split on the first "=" only, so values may contain "=".
+		queryParts := strings.SplitN(s, "=", 2)
 
-		if len(queryParts) != 2 {
-			fmt.Println("Invalid Query Argument:", s)
-			return
+		if len(queryParts) != 2 || queryParts[0] == "" {
+			return fmt.Errorf("invalid query argument: %s", s)
 		}
 
 		q.Add(queryParts[0], queryParts[1])
@@ -126,11 +166,16 @@ func displayLink(loadedConfig *config) {
 	if loadedConfig.LndConnect.Url {
 		fmt.Println(u.String())
 	} else if loadedConfig.LndConnect.Image {
-		qrcode.WriteFile(u.String(), qrcode.Medium, 512, "lndconnect-qr.png")
+		err := qrcode.WriteFile(u.String(), qrcode.Medium, 512, "lndconnect-qr.png")
+		if err != nil {
+			return err
+		}
 		fmt.Println("Wrote QR Code to file \"lndconnect-qr.png\"")
 	} else {
 		obj := qrcodeTerminal.New()
 		obj.Get(u.String()).Print()
 		fmt.Println("\n⚠️  Press \"cmd + -\" a few times to see the full QR Code!\nIf that doesn't work run \"lndconnect -j\" to get a code you can copy paste into the app.")
 	}
+
+	return nil
 }
